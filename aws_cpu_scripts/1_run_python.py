@@ -20,27 +20,188 @@ from matplotlib.patches import Rectangle
 plt.rcParams["figure.figsize"] = (10,10)
 plt.rcParams.update({'font.size':10})
 
-config_file = os.getcwd() + '/configs/swin-sim-seg/1_mask_rcnn_swin-t-p4-w7_fpn_ms-crop-3x_sim_seg.py'
-checkpoint_file = os.getcwd() + '/saved_model/epoch_50.pth'
-model = init_detector(config_file,checkpoint_file)
+working_directory = os.getcwd()
+data_directory = os.path.join(working_directory, 'data')
+save_directory = os.path.join(working_directory, 'predictions')
+config_file = os.path.join(
+    working_directory,
+    'configs',
+    'swin-sim-seg',
+    '1_mask_rcnn_swin-t-p4-w7_fpn_ms-crop-3x_sim_seg.py'
+)
+checkpoint_file = os.path.join(
+    working_directory,
+    'saved_model',
+    'epoch_50.pth'
+)
 
-# Obtain the cell probability threshold from provided parameters
+# Obtain the cell probability threshold from provided parameters.
 cell_prob_param = float(sys.argv[1])
-print(cell_prob_param)
+print('Cell probability threshold:', cell_prob_param)
 
-# Scan the current images, and generate the corresponding folder in predictions:
+os.makedirs(save_directory, exist_ok=True)
+
+
+def record_skipped_file(image_path, reason):
+    """Record an image that produced no usable SWIN output."""
+    report_path = os.path.join(save_directory, 'skipped_files.txt')
+    file_name = os.path.basename(image_path)
+
+    with open(report_path, 'a', encoding='utf-8') as f:
+        f.write(f"{file_name}\t{reason}\n")
+
+    print('SKIPPED FILE:', file_name, '-', reason)
+
+
+def is_ground_truth_file(file_name):
+    """Return True for common ground-truth filename patterns."""
+    stem = os.path.splitext(file_name)[0].lower()
+
+    return (
+        stem == 'gt'
+        or stem.startswith('gt_')
+        or stem.endswith('_gt')
+        or '_gt_' in stem
+    )
+
+
+def get_job_folder(image_path):
+    """
+    Return the first directory below data/.
+
+    Expected web layout:
+        data/<job-id>/Z-Projection/<image>
+    """
+    relative_path = os.path.relpath(image_path, data_directory)
+    path_parts = relative_path.split(os.sep)
+
+    if len(path_parts) > 1:
+        return path_parts[0]
+
+    return 'default'
+
+
+def get_prediction_paths(image_path):
+    """Return the output directory, NPY path, and overlay PNG path."""
+    job_folder = get_job_folder(image_path)
+    output_directory = os.path.join(save_directory, job_folder)
+    input_stem = os.path.splitext(os.path.basename(image_path))[0]
+
+    os.makedirs(output_directory, exist_ok=True)
+
+    return (
+        output_directory,
+        os.path.join(output_directory, input_stem + '.npy'),
+        os.path.join(output_directory, input_stem + '_overlay.png'),
+    )
+
+
+# Find TIFF inputs recursively. Do not require the filename to contain
+# the exact, case-sensitive text "ZSeries".
 image_list = []
-save_directory = os.getcwd() + '/predictions/'
-for root, dirs, files in os.walk(os.getcwd() + '/data/'):
-    for file in files:
-        if file.endswith(".tif") and "ZSeries" in file and "gt" not in file:
-            print(file)
-            image_list.append(os.path.join(root, file))
-            folder_name = root.split('data')[1].split('/')[1]
-            if not os.path.exists(os.path.join(save_directory, folder_name)):
-                os.makedirs(os.path.join(save_directory, folder_name)) 
+
+for root, dirs, files in os.walk(data_directory):
+    for file_name in files:
+        lower_file_name = file_name.lower()
+
+        if not lower_file_name.endswith(('.tif', '.tiff')):
+            continue
+
+        if is_ground_truth_file(file_name):
+            continue
+
+        image_path = os.path.join(root, file_name)
+        image_list.append(image_path)
+
+        # Create the prediction folder before inference.
+        get_prediction_paths(image_path)
+        print('Found SWIN input:', image_path)
+
 image_list.sort()
-print(len(image_list))   
+print('Total SWIN input images:', len(image_list))
+
+if not image_list:
+    raise FileNotFoundError(
+        'No .tif or .tiff input images were found under '
+        f'{data_directory}. The old code required "ZSeries" in the '
+        'filename; that requirement has now been removed.'
+    )
+
+# Load the model only after confirming that input images exist.
+model = init_detector(config_file, checkpoint_file)
+
+
+def find_contours(amask):
+    temp = amask.astype('uint8')
+    contours, hierarchy = cv.findContours(temp, cv.RETR_TREE, cv.CHAIN_APPROX_NONE)[-2:]
+    return contours
+
+def find_coordinates(aContour):
+    #print(aContour)
+    temp = aContour.reshape(aContour.shape[0],2)
+    x_coord = temp[:,0]
+    y_coord = temp[:,1]
+    return x_coord, y_coord
+def centroid(arr1, arr2):
+    length = arr1.shape[0]
+    w = np.max(arr1) - np.min(arr1)
+    h = np.max(arr2) - np.min(arr2)
+    sum_x = np.sum(arr1)
+    sum_y = np.sum(arr2)
+    return sum_x/length, sum_y/length, w, h
+
+## Added lines
+
+def save_overlay_png(original_image_path, masks, output_png_path):
+    """
+    Saves a 512x512 PNG image showing:
+    - original grayscale image
+    - red outlines around predicted masks
+    - yellow labels M0, M1, M2, ...
+    """
+
+    # Read original tif image
+    img = io.imread(original_image_path)
+
+    # If image has more than 2 dimensions, squeeze it
+    img = np.squeeze(img)
+
+    # Make the saved PNG exactly 512x512 pixels
+    fig, ax = plt.subplots(figsize=(5.12, 5.12), dpi=100)
+    ax.imshow(img, cmap="gray")
+    ax.axis("off")
+    ax.set_position([0, 0, 1, 1])
+
+    for i in range(masks.shape[0]):
+        mask = masks[i].astype(np.uint8)
+
+        contours = find_contours(mask)
+
+        if len(contours) == 0:
+            continue
+
+        # Use largest contour if there are multiple pieces
+        largest_contour = max(contours, key=cv.contourArea)
+
+        x_coords, y_coords = find_coordinates(largest_contour)
+
+        # Draw red outline
+        ax.plot(x_coords, y_coords, color="red", linewidth=1)
+
+        # Label near centroid
+        cen_x, cen_y, w, h = centroid(x_coords, y_coords)
+        ax.text(
+            cen_x,
+            cen_y + 12,
+            f"M{i}",
+            color="yellow",
+            fontsize=8,
+            weight="bold"
+        )
+
+    fig.savefig(output_png_path, dpi=100, pad_inches=0)
+    plt.close(fig)
+
 
 # Post-prcessing: Remove small or large predictions, and predictions near the edges
 def refine_the_predicitions(bbox_collection, seg_collection):
@@ -61,7 +222,13 @@ def refine_the_predicitions(bbox_collection, seg_collection):
 def post_processing_the_predictions(refined_seg_collection):
         post_proc_seg_collection = []
         dup_cell = []
-        
+
+        if (
+            refined_seg_collection.ndim != 3
+            or refined_seg_collection.shape[0] == 0
+        ):
+            return np.asarray(post_proc_seg_collection)
+
         for index1 in range(0, refined_seg_collection.shape[0]):
             if index1 not in dup_cell:
                 first_cell = refined_seg_collection[index1,:,:]>0
@@ -96,11 +263,12 @@ def save_segmentation_results():
         
         filename = image_list[number]
         img = filename
-        
-        bbox_collection = inference_detector(model,img)[0][0]
-        bbox_collection = np.asarray(bbox_collection)
-        seg_collection = inference_detector(model,img)[1][0]
-        seg_collection = np.asarray(seg_collection)
+
+        # Run inference once. The older code ran the same image through the
+        # model twice: once for boxes and once for masks.
+        inference_result = inference_detector(model, img)
+        bbox_collection = np.asarray(inference_result[0][0])
+        seg_collection = np.asarray(inference_result[1][0])
         
         
         """ Refine the predictions:"""
@@ -109,16 +277,28 @@ def save_segmentation_results():
         """ Post-processing the predictions:"""
         post_proc_seg_collection = post_processing_the_predictions(refined_seg_collection)
 
-        """ Generate the figures from post-processing: """
-        if post_proc_seg_collection.shape[0]!=0:
-            
-            """Save the numpy array"""
-            output_image_name = os.path.join(save_directory, filename.split('/')[-3], filename.split('/')[-1])
-            output_numpy_name = output_image_name[:-4] + '.npy'
-            np.save(output_numpy_name, post_proc_seg_collection)
-        else:
+        """ Generate the figures from post-processing. """
+        (
+            output_directory,
+            output_numpy_name,
+            output_overlay_name,
+        ) = get_prediction_paths(filename)
+
+        # If SWIN produced no usable predictions, do not create an empty
+        # RoiSet.zip or a blank/unchanged PNG. Record the file name instead.
+        if post_proc_seg_collection.ndim != 3 or post_proc_seg_collection.shape[0] == 0:
+            raw_count = bbox_collection.shape[0] if bbox_collection.ndim >= 2 else 0
+            refined_count = refined_seg_collection.shape[0] if refined_seg_collection.ndim >= 3 else 0
+            reason = (
+                'SWIN produced no usable predictions '
+                f'(raw={raw_count}, after_filter={refined_count}, after_overlap=0)'
+            )
             print('---------------------------------------------------------------')
-            print('delete %s'%filename)
+            record_skipped_file(filename, reason)
+            continue
+
+        np.save(output_numpy_name, post_proc_seg_collection)
+        save_overlay_png(filename, post_proc_seg_collection, output_overlay_name)
 save_segmentation_results()            
 
 # Save the ROI Zip files to be read by ImageJ/Fiji
@@ -200,27 +380,14 @@ def shoelace(coords):
     area = abs(area) / 2.0
     return area
 
-def find_contours(amask):
-    temp = amask.astype('uint8')
-    contours, hierarchy = cv.findContours(temp, cv.RETR_TREE, cv.CHAIN_APPROX_NONE)[-2:]
-    return contours
-
-def find_coordinates(aContour):
-    #print(aContour)
-    temp = aContour.reshape(aContour.shape[0],2)
-    x_coord = temp[:,0]
-    y_coord = temp[:,1]
-    return x_coord, y_coord
-def centroid(arr1, arr2):
-    length = arr1.shape[0]
-    w = np.max(arr1) - np.min(arr1)
-    h = np.max(arr2) - np.min(arr2)
-    sum_x = np.sum(arr1)
-    sum_y = np.sum(arr2)
-    return sum_x/length, sum_y/length, w, h
   
 def generate_zip(current_cell, current_cell_index, roi_path, result_path):
     contours = find_contours(current_cell)
+
+    if len(contours) == 0:
+        print('No contour found for current SWIN mask, skipping ROI.')
+        return False
+
     if (len(contours)>1):
         area_lst = []
         for acontour in contours:
@@ -229,7 +396,7 @@ def generate_zip(current_cell, current_cell_index, roi_path, result_path):
         max_idx = area_lst.index(max(area_lst))
         valid_contour = contours[max_idx]
         valid_area = area_lst[max_idx]
-    elif len(contours)!=0: 
+    else:
         valid_contour = contours[0]
         valid_area = shoelace(find_coordinates(valid_contour))
 
@@ -239,30 +406,43 @@ def generate_zip(current_cell, current_cell_index, roi_path, result_path):
     roi_name = '%03d-%03d-%03d'%(cen_info[0], cen_info[1], z_coords)
     current_cell_index = '%03d'%current_cell_index
     roiexport(roi_path + '/' + str(current_cell_index) +'.roi', list(x_coords), list(y_coords), z_coords, roi_name)
-    shutil.make_archive(roi_path, 'zip', roi_path)
-    
-    
+    return True
+
+
 print('start generating roi')
 for current_name in image_list:
-    current_masks_path = save_directory + current_name.split('data')[1].split('Z-Projection')[0] + current_name.split('Z-Projection')[1][:-4] + '.npy'
+    (
+        result_dir_prefix,
+        current_masks_path,
+        output_overlay_name,
+    ) = get_prediction_paths(current_name)
+
     if not os.path.exists(current_masks_path):
         continue
-    #print(current_masks_path)
+
     current_masks = np.load(current_masks_path)
     print(current_masks.shape)
-    
-    stack_num = current_name.split('Stack_')[1].split('_')[0]
-    stack_num = int(stack_num) // 10
-    #print(stack_num)
-    result_dir_prefix = save_directory + '/' + current_name.split('data')[1].split('Z-Projection')[0]
-    if not os.path.exists(result_dir_prefix):
-        os.makedirs(result_dir_prefix)
-    
-    roi_path = result_dir_prefix + '/RoiSet' + '_' + str(stack_num)
+
+    # Name the ROI zip using the original input file name so it is easy
+    # to tell which stack produced which result.
+    input_stem = os.path.splitext(os.path.basename(current_name))[0]
+    roi_path = os.path.join(result_dir_prefix, input_stem + '_RoiSet')
     if not os.path.exists(roi_path):
         os.makedirs(roi_path)
-    
+
+    roi_count = 0
     for current_cell_index in range(0, current_masks.shape[0]):
         current_cell = current_masks[current_cell_index,:,:]
-        #print(current_cell_index)
-        generate_zip(current_cell, current_cell_index, roi_path, result_dir_prefix)
+        created = generate_zip(current_cell, current_cell_index, roi_path, result_dir_prefix)
+        if created:
+            roi_count += 1
+
+    # Create one zip per stack only when at least one ROI was created.
+    # Skipped/no-detection images are listed in skipped_files.txt instead.
+    if roi_count == 0:
+        record_skipped_file(current_name, 'SWIN mask file existed, but no ROI contours could be exported')
+        shutil.rmtree(roi_path)
+        continue
+
+    shutil.make_archive(roi_path, 'zip', roi_path)
+    print('Saved %s.zip with %d ROI files' % (roi_path, roi_count))
